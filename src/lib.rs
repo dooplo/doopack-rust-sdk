@@ -1,10 +1,55 @@
+//! # Doopack Rust SDK
+//! 
+//! O **Doopack Rust SDK** é a biblioteca oficial para desenvolvimento de microsserviços (Event-Driven) dentro do ecossistema Doopack.
+//! Ele utiliza a arquitetura de **Database Proxy**, repassando a carga de conexão pesada para o Orquestrador e garantindo 
+//! um Cold Start próximo de zero.
+//! 
+//! ## Variáveis de Ambiente Injetadas
+//! O Doopack Orquestrador injeta variáveis de ambiente cruciais no momento da execução:
+//! - `PAYLOAD_INPUT`: O JSON do evento/trigger que acionou o serviço.
+//! - `DOOPACK_PROXY_URL`: A URL da API interna do Orquestrador que processará as queries de banco.
+//! 
+//! ## Exemplo de CRUD com SurrealDB
+//! ```rust,no_run
+//! use doopack_rust_sdk::{get_input, send_output, query_surreal};
+//! use serde_json::json;
+//! 
+//! #[tokio::main]
+//! async fn main() {
+//!     // Lendo o input (ex: {"action": "create", "name": "Doopack"})
+//!     let payload = get_input().unwrap_or(json!({ "action": "read" }));
+//!     let action = payload["action"].as_str().unwrap_or("read");
+//!     let pool_name = "MEUBANCO"; // Configurado no painel do Doopack
+//! 
+//!     let db_result = match action {
+//!         "create" => {
+//!             let name = payload["name"].as_str().unwrap_or("User");
+//!             query_surreal(pool_name, "CREATE users SET name = $name;", Some(json!({ "name": name }))).await
+//!         },
+//!         "read" => {
+//!             query_surreal(pool_name, "SELECT * FROM users;", None).await
+//!         },
+//!         "update" => {
+//!             query_surreal(pool_name, "UPDATE type::thing($id) SET updated = true;", Some(json!({ "id": "users:123" }))).await
+//!         },
+//!         "delete" => {
+//!             query_surreal(pool_name, "DELETE type::thing($id);", Some(json!({ "id": "users:123" }))).await
+//!         },
+//!         _ => Ok(vec![]),
+//!     };
+//! 
+//!     // Responde ao orquestrador
+//!     send_output(&json!({
+//!         "status": "success",
+//!         "db_response": db_result.unwrap_or_default()
+//!     }));
+//! }
+//! ```
+//! 
+
 use std::env;
 use serde::Serialize;
 use serde_json::Value;
-
-pub use surrealdb;
-pub use surrealdb::types::RecordId;
-pub use surrealdb::types::SurrealValue;
 
 /// Retrieves the input payload passed to the microservice by the orchestrator.
 /// This reads the `PAYLOAD_INPUT` environment variable and parses it as JSON.
@@ -25,64 +70,30 @@ pub fn send_output<T: Serialize>(output: &T) {
     }
 }
 
-/// Retrieves the connection URL of a database pool configured in the orchestrator.
-pub fn get_db_pool(name: &str) -> Result<String, String> {
-    let env_var_name = format!("DB_POOL_{}", name.to_uppercase().replace('-', "_"));
-    env::var(&env_var_name)
-        .map_err(|e| format!("Database pool '{}' not found in environment: {}", name, e))
-}
+/// Query a SurrealDB instance configured in Doopack.
+/// This sends the query over HTTP to the Doopack Orchestrator Proxy, protecting your database
+/// from connection exhaustion.
+pub async fn query_surreal(pool_name: &str, query: &str, bindings: Option<Value>) -> Result<Vec<Value>, String> {
+    let proxy_url = env::var("DOOPACK_PROXY_URL").unwrap_or_else(|_| "http://localhost:4500/api/v1/internal/proxy/db/query".to_string());
+    
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({
+        "pool": pool_name,
+        "query": query,
+        "bindings": bindings
+    });
 
-/// Connects to SurrealDB using the pool credentials configured in the orchestrator,
-/// automatically selecting the namespace and database.
-pub async fn connect_surreal(name: &str) -> Result<surrealdb::Surreal<surrealdb::engine::any::Any>, String> {
-    let prefix = format!("DB_POOL_{}", name.to_uppercase().replace('-', "_"));
-    let mut url = env::var(&prefix)
-        .map_err(|e| format!("Database pool '{}' not found in environment: {}", name, e))?;
-    
-    // Self-healing: if url starts with wss:// or https:// and has no port, append :443
-    if url.starts_with("wss://") || url.starts_with("https://") {
-        if let Some(idx) = url.find("://") {
-            let host_part = &url[idx + 3..];
-            if !host_part.contains(':') {
-                url = format!("{}:443", url);
-            }
-        }
+    let res = client.post(&proxy_url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Proxy request failed: {}", e))?;
+
+    if res.status().is_success() {
+        let results: Vec<Value> = res.json().await.map_err(|e| format!("Failed to parse proxy JSON: {}", e))?;
+        Ok(results)
+    } else {
+        let err_text = res.text().await.unwrap_or_default();
+        Err(format!("Proxy returned error: {}", err_text))
     }
-    
-    let db = surrealdb::engine::any::connect(&url).await
-        .map_err(|e| format!("Failed to connect to SurrealDB at '{}': {}", url, e))?;
-    
-    let ns_key = format!("{}_NS", prefix);
-    let db_key = format!("{}_DB", prefix);
-    let user_key = format!("{}_USER", prefix);
-    let pass_key = format!("{}_PASS", prefix);
-    
-    if let (Ok(user), Ok(pass)) = (env::var(&user_key), env::var(&pass_key)) {
-        let ns = env::var(&ns_key).unwrap_or_default();
-        let db_name = env::var(&db_key).unwrap_or_default();
-        
-        // Try Root sign-in first, fallback to Database sign-in if it fails
-        let root_creds = surrealdb::opt::auth::Root {
-            username: user.clone(),
-            password: pass.clone(),
-        };
-        
-        if let Err(_) = db.signin(root_creds).await {
-            let db_creds = surrealdb::opt::auth::Database {
-                namespace: ns,
-                database: db_name,
-                username: user,
-                password: pass,
-            };
-            db.signin(db_creds).await
-                .map_err(|e| format!("Failed to sign in to SurrealDB: {}", e))?;
-        }
-    }
-    
-    if let (Ok(ns), Ok(database)) = (env::var(&ns_key), env::var(&db_key)) {
-        db.use_ns(&ns).use_db(&database).await
-            .map_err(|e| format!("Failed to select namespace '{}' or database '{}': {}", ns, database, e))?;
-    }
-    
-    Ok(db)
 }
